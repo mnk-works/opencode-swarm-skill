@@ -82,6 +82,43 @@ function ensureDirs() {
   return { swarmDir: absSwarmDir, logDir: absLogDir };
 }
 
+function findAvailablePort(startPort = 8765) {
+  return new Promise((resolve, reject) => {
+    const net = require('net');
+    const server = net.createServer();
+    server.unref();
+    server.on('error', () => {
+      // Port in use, try next
+      resolve(findAvailablePort(startPort + 1));
+    });
+    server.listen(startPort, () => {
+      const port = server.address().port;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+// Write/merge the swarm MCP server into a project's opencode.json so that
+// spawned `opencode run` sessions load the swarm.* tools automatically.
+function writeMcpConfig(projectRoot, mcpUrl) {
+  const configFile = path.join(projectRoot, 'opencode.json');
+  let config = {};
+  try {
+    if (fs.existsSync(configFile)) {
+      config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    }
+  } catch (e) {
+    console.error(`  WARNING: could not parse ${configFile}: ${e.message}`);
+    return;
+  }
+  
+  config.mcp = config.mcp || {};
+  config.mcp.servers = config.mcp.servers || {};
+  config.mcp.servers.swarm = { type: 'remote', url: mcpUrl };
+  
+  fs.writeFileSync(configFile, JSON.stringify(config, null, 2) + '\n');
+}
+
 // ============================================================
 // Model Discovery
 // ============================================================
@@ -507,16 +544,65 @@ async function cmdStart() {
   
   console.log(`Starting swarm with ${config.agents.length} agents...`);
   
-  // Start MCP server (in background)
+  // Find an available port for MCP server
+  const mcpPort = await findAvailablePort(8765);
+  console.log(`  MCP server port: ${mcpPort}`);
+  
+  // Update config with actual MCP port
+  config.mcp = { host: 'localhost', port: mcpPort };
+  const yaml = require('js-yaml');
+  fs.writeFileSync(CONFIG_FILE, yaml.dump(config, { lineWidth: 120, noRefs: true }));
+  
+  // Start MCP server (SSE) on the chosen port.
+  // NOTE: must run server.py directly — `python -m mcp.server` resolves to the
+  // installed mcp SDK's stdio server, not this skill's server.
   const pythonCmd = spawnSync('which', ['python3']).status === 0 ? 'python3' : 'python';
-  const mcpProc = spawn(pythonCmd, ['-m', 'mcp.server'], {
-    cwd: path.join(__dirname, '..', 'mcp'),
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+  const mcpDir = path.join(__dirname, '..', 'mcp');
+  const serverPath = path.join(mcpDir, 'server.py');
+  const mcpLogStream = fs.createWriteStream(path.join(dirs.logDir, 'mcp.log'), { flags: 'a' });
+  await new Promise((resolve, reject) => {
+    mcpLogStream.on('open', resolve);
+    mcpLogStream.on('error', reject);
   });
   
-  // Give MCP server a moment to start
-  await new Promise(r => setTimeout(r, 1000));
+  const mcpProc = spawn(pythonCmd, ['-u', serverPath, '--port', String(mcpPort)], {
+    cwd: mcpDir,
+    detached: true,
+    stdio: ['ignore', mcpLogStream, mcpLogStream],
+  });
+  mcpProc.unref();
+  mcpLogStream.end(); // child holds its own fd now; release our handle
+  
+  // Give MCP server a moment to start, then verify it is listening
+  await new Promise(r => setTimeout(r, 2000));
+  const mcpUp = await new Promise((resolve) => {
+    const net = require('net');
+    const sock = net.connect(mcpPort, '127.0.0.1');
+    sock.on('connect', () => { sock.end(); resolve(true); });
+    sock.on('error', () => resolve(false));
+    setTimeout(() => { sock.destroy(); resolve(false); }, 2000);
+  });
+  if (!mcpUp) {
+    console.error(`  WARNING: MCP server did not open port ${mcpPort} — check ${dirs.logDir}/mcp.log`);
+  }
+  
+  // Point OpenCode at the running MCP server so agents get swarm.* tools.
+  // Writes project-level opencode.json (merged), and updates the global
+  // swarm entry if one exists (keeps sidebar/connection info accurate).
+  const mcpUrl = `http://127.0.0.1:${mcpPort}/mcp`;
+  writeMcpConfig(process.cwd(), mcpUrl);
+  try {
+    const os = require('os');
+    const globalConfig = path.join(os.homedir(), '.config', 'opencode', 'opencode.json');
+    if (fs.existsSync(globalConfig)) {
+      const g = JSON.parse(fs.readFileSync(globalConfig, 'utf8'));
+      if (g.mcp && g.mcp.servers && g.mcp.servers.swarm) {
+        g.mcp.servers.swarm = { type: 'remote', url: mcpUrl };
+        fs.writeFileSync(globalConfig, JSON.stringify(g, null, 2) + '\n');
+      }
+    }
+  } catch (e) { /* global config update is best-effort */ }
+  console.log(`  MCP: ${mcpUrl}`);
   
   const pids = { mcp: mcpProc.pid };
   const agents = config.agents;
@@ -548,6 +634,7 @@ async function cmdStart() {
     
     pids[agent.id] = proc.pid;
     proc.unref();
+    logStream.end(); // child holds its own fd now; release our handle
     console.log(`  Started ${agent.id} (${agent.model}) -> PID ${proc.pid}, log: ${logFile}`);
   }
   

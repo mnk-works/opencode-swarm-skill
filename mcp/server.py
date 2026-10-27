@@ -5,13 +5,38 @@ Provides coordination primitives for multi-agent peer collaboration.
 Each agent connects to this server via MCP and gets access to swarm.* tools.
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP as _FastMCP
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 import json
 import uuid
 import asyncio
+import sys
+
+# ============================================================
+# Port override (must be set before run(); module name "mcp"
+# shadows the installed mcp package, so imports are lazy here)
+# ============================================================
+
+_PORT = 8765
+for _i, _a in enumerate(sys.argv):
+    if _a == "--port":
+        try:
+            _PORT = int(sys.argv[_i + 1])
+        except (ValueError, IndexError):
+            pass
+
+
+class FastMCP(_FastMCP):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.settings.host = "127.0.0.1"
+        self.settings.port = _PORT
+        # Stateless streamable-HTTP: any number of agent clients can POST
+        # without per-connection SSE sessions (no stale-session 404s).
+        self.settings.stateless_http = True
+
 
 mcp = FastMCP("opencode-swarm")
 
@@ -260,4 +285,4 @@ async def get_votes() -> str:
 # ============================================================
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport='streamable-http')
