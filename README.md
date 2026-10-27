@@ -174,6 +174,63 @@ context = await tools.swarm_read_context(agent_id="agent-2")
 await tools.swarm_broadcast("Found root cause in parser at line 234", tags=["bug", "parser"])
 ```
 
+## Controlling the Swarm
+
+Three operator channels, all one-liners:
+
+### 1. Give the swarm work — `task`
+
+```bash
+opencode-swarm task "Refactor the parser module; broadcast your plan before editing"
+```
+
+- **Live swarm** (agents running): the objective is injected into shared state instantly as a claimable task + an operator broadcast. Agents pick it up on their next `swarm_read_context`.
+- **No agents running**: the objective is stored as the **round goal** and heads every agent's prompt on the next `opencode-swarm start` (priority context, above their system prompt).
+
+```bash
+opencode-swarm task --next "goal for the next round"   # queue for next start
+opencode-swarm task --clear                            # remove stored goal
+```
+
+### 2. Direct-message one agent — `say`
+
+```bash
+opencode-swarm say agent-1 "prioritize the failing tests in metrics_collector"
+```
+
+Sends a follow-up turn into that agent's existing OpenCode session (session IDs are recorded by `start` in `.opencode/.swarm-sessions`). Works even after the agent's turn ended — the session persists; this starts a new turn in it. Runs in the foreground so you watch the response live.
+
+### 3. Answer your agents — `inbox`
+
+When an agent calls `swarm_request_human(question, context)`, it lands in your inbox:
+
+```bash
+opencode-swarm inbox
+# [a1b2c3] agent-3: Should we rewrite the parser or patch it?
+#     context: 3 failing tests, patch touches 40 lines, rewrite ~200
+#     answer with: opencode-swarm say agent-3 "your answer"
+```
+
+### Observation
+
+```bash
+opencode-swarm status      # who's alive
+opencode-swarm logs -f     # live broadcast feed
+```
+
+### Round lifecycle
+
+Agents are one-shot `opencode run` turns: spawn → register → read context → claim/propose tasks → work → broadcast → exit. A "round" ends when all turns finish. Control loop:
+
+```bash
+opencode-swarm task --next "the mission"   # or task "..." if agents are live
+opencode-swarm start                       # run a round
+opencode-swarm logs -f                     # watch collaboration
+opencode-swarm inbox                       # handle escalations
+opencode-swarm say agent-2 "steer"         # mid-round steering
+opencode-swarm stop                        # halt a round (or let it finish)
+```
+
 ## Troubleshooting
 
 | Issue | Solution |

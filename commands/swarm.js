@@ -20,6 +20,7 @@ const os = require('os');
 const SWARM_DIR = '.opencode';
 const CONFIG_FILE = path.join(SWARM_DIR, 'swarm.yaml');
 const PID_FILE = path.join(SWARM_DIR, '.swarm-pids');
+const SESSIONS_FILE = path.join(SWARM_DIR, '.swarm-sessions');
 const LOG_DIR = path.join(SWARM_DIR, 'swarm-logs');
 
 function printUsage() {
@@ -39,6 +40,9 @@ COMMANDS
   stop                                            Stop all swarm agents
   status                                          Show agent status and activity
   logs [--follow]                                 Show recent broadcasts
+  task "objective"                                Give the swarm work (live or next round)
+  say <agent-id> "message"                        Direct-message one agent's session
+  inbox                                           Show agents' requests for you
 
 EXAMPLES
   opencode-swarm init                    # Interactive setup (default)
@@ -53,6 +57,9 @@ EXAMPLES
   opencode-swarm start
   opencode-swarm status
   opencode-swarm logs -f
+  opencode-swarm task "Refactor the parser module and broadcast your plan first"
+  opencode-swarm say agent-1 "prioritize the failing tests"
+  opencode-swarm inbox
 `);
 }
 
@@ -117,6 +124,204 @@ function writeMcpConfig(projectRoot, mcpUrl) {
   config.mcp.servers.swarm = { type: 'remote', url: mcpUrl };
   
   fs.writeFileSync(configFile, JSON.stringify(config, null, 2) + '\n');
+}
+
+// ============================================================
+// Swarm Control (operator -> swarm channels)
+// ============================================================
+
+// The MCP server URL written by `start` into the project's opencode.json.
+function loadServerUrl() {
+  try {
+    const oc = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'opencode.json'), 'utf8'));
+    const u = oc.mcp && oc.mcp.servers && oc.mcp.servers.swarm && oc.mcp.servers.swarm.url;
+    if (u) return u;
+  } catch (e) { /* fallthrough */ }
+  return null;
+}
+
+// Minimal MCP client: stateless streamable-HTTP tools/call.
+async function mcpCall(url, tool, args) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: Date.now() % 1000000,
+      method: 'tools/call',
+      params: { name: tool, arguments: args },
+    }),
+  });
+  const raw = await res.text();
+  const line = raw.split('\n').find(l => l.startsWith('data: '));
+  const payload = JSON.parse(line ? line.slice(6) : raw);
+  if (payload.error) throw new Error(payload.error.message || 'MCP error');
+  const content = payload.result && payload.result.content && payload.result.content[0];
+  if (payload.result && payload.result.isError) throw new Error(content ? content.text : 'tool error');
+  return content ? content.text : '';
+}
+
+function loadSessions() {
+  if (!fs.existsSync(SESSIONS_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch (e) { return {}; }
+}
+
+function saveSessions(sessions) {
+  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+}
+
+// Agents from the pids file whose processes are still alive.
+function liveAgents() {
+  const pids = loadPids();
+  const alive = [];
+  for (const [id, pid] of Object.entries(pids)) {
+    if (id === 'mcp') continue;
+    try { process.kill(pid, 0); alive.push(id); } catch (e) { /* dead */ }
+  }
+  return alive;
+}
+
+// Give the swarm work. Live swarm -> injected into shared state immediately;
+// no live agents -> stored as the round goal for the next `start`.
+async function cmdTask(args) {
+  const clear = args.includes('--clear');
+  const next = args.includes('--next');
+  const text = args.filter(a => !a.startsWith('-')).join(' ').trim();
+
+  if (clear) {
+    const config = loadConfig();
+    delete config.goal;
+    const yaml = require('js-yaml');
+    fs.writeFileSync(CONFIG_FILE, yaml.dump(config, { lineWidth: 120, noRefs: true }));
+    console.log('Round goal cleared.');
+    return;
+  }
+
+  if (next) {
+    if (!text) { console.log('Usage: opencode-swarm task --next "goal for the next round"'); return; }
+    const config = loadConfig();
+    config.goal = text;
+    const yaml = require('js-yaml');
+    fs.writeFileSync(CONFIG_FILE, yaml.dump(config, { lineWidth: 120, noRefs: true }));
+    console.log(`Goal stored for the next round:\n  ${text}`);
+    console.log('Run "opencode-swarm start" to launch a round with this goal heading every agent\'s prompt.');
+    return;
+  }
+
+  if (!text) {
+    console.log('Usage:');
+    console.log('  opencode-swarm task "what the swarm should do"   # live swarm: injected now');
+    console.log('  opencode-swarm task --next "goal"                # no agents running: queue for next start');
+    console.log('  opencode-swarm task --clear                      # remove stored goal');
+    return;
+  }
+
+  const url = loadServerUrl();
+  const alive = liveAgents();
+
+  if (url && alive.length > 0) {
+    try {
+      const result = await mcpCall(url, 'swarm_propose_task', {
+        agent_id: 'operator',
+        subtask: text,
+        context: 'Issued by the human operator. Any agent may claim this; coordinate with peers.',
+      });
+      let taskId = '(unknown)';
+      try { taskId = JSON.parse(result).task_id || taskId; } catch (e) {}
+      await mcpCall(url, 'swarm_broadcast', {
+        agent_id: 'operator',
+        finding: `Operator objective: ${text}`,
+        tags: ['operator', 'goal', 'task'],
+      });
+      console.log(`Task ${taskId} delivered to ${alive.length} live agent(s): ${alive.join(', ')}`);
+      console.log('Agents pick it up on their next swarm_read_context. Watch with: opencode-swarm logs -f');
+      return;
+    } catch (e) {
+      console.log(`Live injection failed (${e.message.split('\n')[0]}). Falling back to next-round goal.`);
+    }
+  } else if (!url) {
+    console.log('MCP server not reachable (no swarm running).');
+  } else {
+    console.log('No live agents detected (all finished their turns).');
+  }
+
+  // Fallback: queue as the goal for the next round
+  const config = loadConfig();
+  config.goal = text;
+  const yaml = require('js-yaml');
+  fs.writeFileSync(CONFIG_FILE, yaml.dump(config, { lineWidth: 120, noRefs: true }));
+  console.log(`Goal stored for the next round:\n  ${text}`);
+  console.log('Run "opencode-swarm start" to launch a round with this goal.');
+}
+
+// Direct-message a specific agent's session (works even after its turn ended —
+// the session persists in OpenCode; this starts a new turn in it).
+async function cmdSay(args) {
+  const agentId = args.find(a => !a.startsWith('-'));
+  if (!agentId) {
+    console.log('Usage: opencode-swarm say <agent-id> "message"');
+    console.log('       opencode-swarm say agent-1 "focus on the parser bug"');
+    return;
+  }
+  const msgStart = args.indexOf(agentId) + 1;
+  const message = args.slice(msgStart).join(' ').trim();
+  if (!message) {
+    console.log('Usage: opencode-swarm say <agent-id> "message"');
+    return;
+  }
+
+  const config = loadConfig();
+  const agent = config.agents.find(a => a.id === agentId);
+  if (!agent) {
+    console.log(`Agent ${agentId} not in roster. Current agents:`);
+    config.agents.forEach(a => console.log(`  ${a.id}: ${a.model}`));
+    return;
+  }
+
+  const sessions = loadSessions();
+  const sid = sessions[agentId];
+  if (!sid) {
+    console.log(`No recorded session for ${agentId}.`);
+    console.log('Sessions are recorded by "opencode-swarm start". Recorded: ' + (Object.keys(sessions).join(', ') || 'none'));
+    return;
+  }
+
+  console.log(`→ ${agentId} (${agent.model}): ${message}\n`);
+  const proc = spawnSync('opencode', ['run', '-m', agent.model, '--session', sid, message], {
+    stdio: 'inherit',
+  });
+  if (proc.error) console.error(`Failed to run opencode: ${proc.error.message}`);
+}
+
+// The human-in-the-loop inbox: agents' swarm_request_human escalations.
+async function cmdInbox() {
+  const url = loadServerUrl();
+  if (!url) {
+    console.log('MCP server not reachable — no live swarm. Run "opencode-swarm start" first.');
+    return;
+  }
+  let raw;
+  try {
+    raw = await mcpCall(url, 'swarm_read_context', { agent_id: 'operator' });
+  } catch (e) {
+    console.log(`Could not reach swarm server: ${e.message.split('\n')[0]}`);
+    return;
+  }
+  let state;
+  try { state = JSON.parse(raw); } catch (e) { console.log('Unparseable swarm state.'); return; }
+
+  const reqs = state.human_requests || [];
+  if (reqs.length === 0) {
+    console.log('Inbox empty — no agent has escalated anything.');
+  } else {
+    console.log(`${reqs.length} request(s) from agents:\n`);
+    for (const r of reqs) {
+      console.log(`[${r.id}] ${r.agent_id || r.from || '?'}: ${r.question}`);
+      if (r.context) console.log(`    context: ${r.context}`);
+      console.log(`    answer with: opencode-swarm say ${r.agent_id || r.from || '<agent>'} "your answer"\n`);
+    }
+  }
+  console.log(`(${(state.messages || []).length} messages, ${Object.keys(state.tasks || {}).length} tasks in shared state)`);
 }
 
 // ============================================================
@@ -605,6 +810,7 @@ async function cmdStart() {
   console.log(`  MCP: ${mcpUrl}`);
   
   const pids = { mcp: mcpProc.pid };
+  const sessions = loadSessions();
   const agents = config.agents;
   
   for (const agent of agents) {
@@ -617,10 +823,13 @@ async function cmdStart() {
       logStream.on('error', reject);
     });
     
-    const prompt = `${agent.system_prompt}\n\nSwarm config: ${JSON.stringify(config, null, 2)}\n\nConnect to the MCP server and start collaborating.`;
+    // Stored round goal (set via `opencode-swarm task --next "..."`) heads every prompt
+    const goalPrefix = config.goal ? `ROUND GOAL from the operator — top priority:\n${config.goal}\n\n` : '';
+    const prompt = `${goalPrefix}${agent.system_prompt}\n\nSwarm config: ${JSON.stringify(config, null, 2)}\n\nConnect to the MCP server and start collaborating.`;
     
     // Generate a valid session ID (must start with "ses")
     const sessionId = `ses-swarm-${agent.id}-${Date.now()}`;
+    sessions[agent.id] = sessionId;
     
     const proc = spawn('opencode', [
       'run',
@@ -639,7 +848,9 @@ async function cmdStart() {
   }
   
   savePids(pids);
+  saveSessions(sessions);
   console.log('\nSwarm started. Use "opencode-swarm status" to check state.');
+  if (config.goal) console.log(`Round goal: ${config.goal}`);
   console.log(`Logs in ${dirs.logDir}/`);
 }
 
@@ -745,6 +956,15 @@ switch (command) {
     break;
   case 'logs':
     cmdLogs(args.slice(1)).catch(e => { console.error(e); process.exit(1); });
+    break;
+  case 'task':
+    cmdTask(args.slice(1)).catch(e => { console.error(e); process.exit(1); });
+    break;
+  case 'say':
+    cmdSay(args.slice(1)).catch(e => { console.error(e); process.exit(1); });
+    break;
+  case 'inbox':
+    cmdInbox().catch(e => { console.error(e); process.exit(1); });
     break;
   default:
     printUsage();
