@@ -1,0 +1,35 @@
+name: opencode-swarm
+version: 0.1.0
+description: Run a multi-model agent swarm with peer collaboration via MCP. Spawns multiple OpenCode sessions (each with a different model/provider) that coordinate through an embedded MCP server.
+author: mnk-works
+license: MIT
+repository: https://github.com/mnk-works/opencode-swarm-skill
+
+# OpenCode skill manifest
+# https://opencode.ai/docs/skills
+
+mcp:
+  # The MCP server entrypoint - runs in-process when skill is loaded
+  command: python
+  args: [-m, mcp.server]
+  env:
+    PYTHONPATH: "${SKILL_DIR}/mcp"
+
+commands:
+  - swarm
+
+dependencies:
+  - js-yaml
+
+config:
+  # Project-level config file (created by `opencode swarm init`)
+  file: .opencode/swarm.yaml
+  schema: templates/swarm.yaml.schema.json
+
+# Tags for discoverability
+tags:
+  - swarm
+  - multi-agent
+  - mcp
+  - coordination
+  - nemotron

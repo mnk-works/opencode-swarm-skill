@@ -1,0 +1,33 @@
+{
+  "name": "opencode-swarm-skill",
+  "version": "0.1.0",
+  "description": "Multi-model agent swarm with MCP coordination",
+  "main": "commands/swarm.js",
+  "bin": {
+    "opencode-swarm": "commands/swarm.js"
+  },
+  "scripts": {
+    "test": "node commands/swarm.js models",
+    "install:mcp": "pip install mcp pyyaml --break-system-packages"
+  },
+  "keywords": [
+    "opencode",
+    "skill",
+    "swarm",
+    "multi-agent",
+    "mcp",
+    "coordination"
+  ],
+  "author": "mnk-works",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mnk-works/opencode-swarm-skill.git"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
