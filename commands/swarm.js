@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * opencode swarm command
+ * opencode-swarm command
  * 
  * Usage:
- *   opencode swarm init [--interactive]  # Create .opencode/swarm.yaml (interactive model selection)
- *   opencode swarm models [--provider X] # List available models grouped by provider
- *   opencode swarm start                 # Launch all agents
- *   opencode swarm stop                  # Stop all swarm agents
- *   opencode swarm status                # Show swarm state
- *   opencode swarm logs [--follow]       # Show recent broadcast messages
+ *   opencode-swarm init [--interactive]  # Create .opencode/swarm.yaml (interactive model selection)
+ *   opencode-swarm models [--provider X] # List available models grouped by provider
+ *   opencode-swarm start                 # Launch all agents
+ *   opencode-swarm stop                  # Stop all swarm agents
+ *   opencode-swarm status                # Show swarm state
+ *   opencode-swarm logs [--follow]       # Show recent broadcast messages
  */
 
 const fs = require('fs');
@@ -24,10 +24,10 @@ const LOG_DIR = path.join(SWARM_DIR, 'swarm-logs');
 
 function printUsage() {
   console.log(`
-opencode swarm - Multi-agent swarm coordination
+opencode-swarm - Multi-agent swarm coordination
 
 USAGE
-  opencode swarm <command> [options]
+  opencode-swarm <command> [options]
 
 COMMANDS
   init [--interactive]     Create .opencode/swarm.yaml (interactive model selection)
@@ -38,19 +38,19 @@ COMMANDS
   logs [--follow]          Show recent broadcast messages
 
 EXAMPLES
-  opencode swarm init                    # Quick start with defaults
-  opencode swarm init --interactive      # Pick models interactively
-  opencode swarm models                  # See all available models
-  opencode swarm models --provider openrouter
-  opencode swarm start
-  opencode swarm status
-  opencode swarm logs --follow
+  opencode-swarm init                    # Quick start with defaults
+  opencode-swarm init --interactive      # Pick models interactively
+  opencode-swarm models                  # See all available models
+  opencode-swarm models --provider openrouter
+  opencode-swarm start
+  opencode-swarm status
+  opencode-swarm logs --follow
 `);
 }
 
 function loadConfig() {
   if (!fs.existsSync(CONFIG_FILE)) {
-    console.error(`Config not found: ${CONFIG_FILE}. Run 'opencode swarm init' first.`);
+    console.error(`Config not found: ${CONFIG_FILE}. Run 'opencode-swarm init' first.`);
     process.exit(1);
   }
   const yaml = require('js-yaml');
@@ -182,14 +182,13 @@ async function selectModelsInteractive() {
     
     usedModels.add(model);
     
-    // Agent ID
-    const defaultId = ['researcher', 'critic', 'synthesizer', 'planner', 'coder', 'reviewer'][i] || `agent-${i + 1}`;
+    // Agent ID (flat, no roles)
+    const defaultId = `agent-${i + 1}`;
     const idAns = await question(`Agent ID [${defaultId}]: `);
     const id = idAns.trim() || defaultId;
     
-    // Role
-    const roleAns = await question(`Role description: `);
-    const role = roleAns.trim() || `Agent ${i + 1}`;
+    // No role — all agents are equal peers
+    const role = 'Swarm agent';
     
     agents.push({ id, model, role });
   }
@@ -199,17 +198,21 @@ async function selectModelsInteractive() {
 }
 
 function generateSystemPrompt(agent, allAgents) {
-  const peerList = allAgents.filter(a => a.id !== agent.id).map(a => `${a.id} (${a.role})`).join(', ');
-  return `You are the ${agent.id} in a ${allAgents.length}-agent swarm.
-Role: ${agent.role}.
-Peers: ${peerList}.
-Collaborate via swarm.* MCP tools.
-- Use swarm_register("${agent.id}", "${agent.model}", "${agent.role}") on startup
-- Use swarm_broadcast() to share findings
-- Use swarm_read_context() to see peers' work
-- Use swarm_propose_task() to delegate
-- Use swarm_vote() for decisions
-- Use swarm_request_human() when stuck`;
+  const peerIds = allAgents.filter(a => a.id !== agent.id).map(a => a.id).join(', ');
+  return `You are ${agent.id} in a ${allAgents.length}-agent swarm.
+All agents are equal peers — no fixed roles, no hierarchy.
+Peers: ${peerIds}.
+Collaborate via swarm.* MCP tools:
+- swarm_register("${agent.id}", "${agent.model}", "swarm agent") on startup
+- swarm_broadcast(finding, tags?) — share findings with all peers
+- swarm_read_context(since?) — see all shared state
+- swarm_propose_task(subtask, assignee?, context?) — delegate work
+- swarm_claim_task(task_id) — pick up a task
+- swarm_complete_task(task_id, result) — mark done
+- swarm_vote(proposal_id, choice, reasoning?) — collective decisions
+- swarm_propose_vote(question, options?) — start a vote
+- swarm_request_human(question, context?) — escalate to operator
+- swarm_get_config() — read swarm config`;
 }
 
 async function cmdInit(args) {
@@ -239,9 +242,9 @@ async function cmdInit(args) {
     const providers = Object.keys(nemotronModels);
     if (providers.length >= 3) {
       agents = [
-        { id: 'researcher', model: nemotronModels[providers[0]], role: 'Deep technical analysis, find root causes, propose solutions' },
-        { id: 'critic', model: nemotronModels[providers[1]], role: 'Challenge assumptions, find gaps, stress-test proposals' },
-        { id: 'synthesizer', model: nemotronModels[providers[2]], role: 'Merge findings, resolve conflicts, produce final output' },
+        { id: 'agent-1', model: nemotronModels[providers[0]], role: 'Swarm agent' },
+        { id: 'agent-2', model: nemotronModels[providers[1]], role: 'Swarm agent' },
+        { id: 'agent-3', model: nemotronModels[providers[2]], role: 'Swarm agent' },
       ];
     } else {
       // Fallback to first 3 available models from different providers
@@ -250,9 +253,9 @@ async function cmdInit(args) {
         if (models.length > 0) allModels.push({ provider, model: models[0] });
       }
       agents = allModels.slice(0, 3).map((m, i) => ({
-        id: ['researcher', 'critic', 'synthesizer'][i] || `agent-${i+1}`,
+        id: `agent-${i + 1}`,
         model: m.model,
-        role: `Agent ${i + 1} via ${m.provider}`
+        role: 'Swarm agent'
       }));
     }
   }
@@ -296,7 +299,7 @@ async function cmdInit(args) {
   for (const a of agents) {
     console.log(`  ${a.id}: ${a.model} — ${a.role}`);
   }
-  console.log('\nRun "opencode swarm start" to launch the swarm.');
+  console.log('\nRun "opencode-swarm start" to launch the swarm.');
 }
 
 async function cmdModels(args) {
@@ -370,7 +373,7 @@ async function cmdStart() {
   }
   
   savePids(pids);
-  console.log('\nSwarm started. Use "opencode swarm status" to check state.');
+  console.log('\nSwarm started. Use "opencode-swarm status" to check state.');
   console.log(`Logs in ${dirs.logDir}/`);
 }
 
@@ -409,7 +412,7 @@ async function cmdStatus() {
     console.log(`    Role: ${agent.role}`);
   }
   
-  console.log('\n(Use "opencode swarm logs" to see broadcast messages)');
+  console.log('\n(Use "opencode-swarm logs" to see broadcast messages)');
 }
 
 function isProcessRunning(pid) {
