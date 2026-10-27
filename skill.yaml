@@ -1,5 +1,5 @@
 name: opencode-swarm
-version: 0.2.1
+version: 0.3.0
 description: Run a multi-model agent swarm with peer collaboration via MCP. Spawns multiple OpenCode sessions (each with a different model/provider) that coordinate through an embedded MCP server.
 author: mnk-works
 license: MIT

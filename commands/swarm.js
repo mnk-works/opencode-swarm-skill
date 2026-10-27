@@ -22,6 +22,8 @@ const CONFIG_FILE = path.join(SWARM_DIR, 'swarm.yaml');
 const PID_FILE = path.join(SWARM_DIR, '.swarm-pids');
 const SESSIONS_FILE = path.join(SWARM_DIR, '.swarm-sessions');
 const LOG_DIR = path.join(SWARM_DIR, 'swarm-logs');
+const RUNNER_FILE = path.join(SWARM_DIR, 'swarm-runner.sh');
+const PROMPT_DIR = path.join(SWARM_DIR, 'swarm-prompts');
 
 function printUsage() {
   console.log(`
@@ -36,7 +38,7 @@ COMMANDS
   add [--id ID] [--model MODEL] [--role ROLE]     Add agent to swarm
   remove [ID]                                     Remove agent from swarm
   list                                            List current swarm agents
-  start                                           Launch all agents
+  start [--attach|-a] [--detached|-d]             Launch swarm (tmux panes by default)
   stop                                            Stop all swarm agents
   status                                          Show agent status and activity
   logs [--follow]                                 Show recent broadcasts
@@ -54,7 +56,9 @@ EXAMPLES
   opencode-swarm add --id agent-4 --model openrouter/nemotron-3-ultra:free
   opencode-swarm remove agent-2
   opencode-swarm list
-  opencode-swarm start
+  opencode-swarm start                   # tmux: one pane per agent + live dashboard
+  opencode-swarm start -a                # start and attach immediately
+  opencode-swarm start -d                # detached, log files only
   opencode-swarm status
   opencode-swarm logs -f
   opencode-swarm task "Refactor the parser module and broadcast your plan first"
@@ -124,6 +128,123 @@ function writeMcpConfig(projectRoot, mcpUrl) {
   config.mcp.servers.swarm = { type: 'remote', url: mcpUrl };
   
   fs.writeFileSync(configFile, JSON.stringify(config, null, 2) + '\n');
+}
+
+// ============================================================
+// tmux mode — one pane per agent, live output, Enter-to-rerun
+// ============================================================
+
+function tmuxAvailable() {
+  return spawnSync('which', ['tmux']).status === 0;
+}
+
+function tmuxSessionName() {
+  const base = path.basename(process.cwd()).replace(/[^a-zA-Z0-9_-]/g, '') || 'proj';
+  return `swarm-${base}`;
+}
+
+// Kill stray agents/servers from previous launches so restarts are clean.
+function killStraySwarmProcesses() {
+  spawnSync('pkill', ['-f', 'ses[-]swarm-'], { stdio: 'ignore' });
+  spawnSync('pkill', ['-f', 'server[.]py --port'], { stdio: 'ignore' });
+}
+
+// Liveness: is an opencode turn actually running for this session id?
+function agentTurnRunning(sessionId) {
+  if (!sessionId) return false;
+  // [-]-session avoids pgrep interpreting the leading dash as an option
+  return spawnSync('pgrep', ['-f', `[-]-session ${sessionId}`]).status === 0;
+}
+
+// The per-agent pane loop: run one turn, tee to log, wait for Enter, repeat.
+function writeRunnerScript() {
+  const script = `#!/usr/bin/env bash
+# opencode-swarm agent runner (one tmux pane per agent)
+# [Enter] after a turn = another round for this agent; Ctrl-C = stop this agent.
+AGENT_ID="$1"; MODEL="$2"; SESSION_ID="$3"; PROMPT_FILE="$4"; LOG_FILE="$5"
+sleep 3  # let the MCP server pane come up first
+while true; do
+  echo "=== [$AGENT_ID] turn start $(date '+%H:%M:%S') ==="
+  opencode run -m "$MODEL" --session "$SESSION_ID" "$(cat "$PROMPT_FILE")" 2>&1 | tee -a "$LOG_FILE"
+  echo
+  echo "=== [$AGENT_ID] turn finished $(date '+%H:%M:%S') — [Enter] next round, Ctrl-C quit ==="
+  read || break
+done
+`;
+  fs.writeFileSync(RUNNER_FILE, script);
+  fs.chmodSync(RUNNER_FILE, 0o755);
+}
+
+// Live dashboard pane: renders the swarm's shared state every 5 seconds.
+function writeMonitorScript(port) {
+  const script = `#!/usr/bin/env python3
+"""opencode-swarm live monitor — renders shared state (messages, tasks, escalations)."""
+import json, subprocess, sys, time
+
+PORT = ${port}
+
+def fetch():
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "swarm_read_context", "arguments": {"agent_id": "monitor"}},
+    })
+    r = subprocess.run([
+        "curl", "-s", "-m", "4", "-X", "POST", f"http://127.0.0.1:{PORT}/mcp",
+        "-H", "Content-Type: application/json",
+        "-H", "Accept: application/json, text/event-stream",
+        "-d", body,
+    ], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if line.startswith("data: "):
+            payload = json.loads(line[6:])
+            return json.loads(payload["result"]["content"][0]["text"])
+    return None
+
+subprocess.run(["clear"])
+state = fetch()
+if state is None:
+    print(f"swarm monitor: MCP server not reachable on :{PORT}")
+    sys.exit(0)
+
+agents = state.get("agents", {})
+tasks = state.get("tasks", {})
+msgs = state.get("messages", [])
+reqs = state.get("human_requests", [])
+
+print("=" * 78)
+print(f" OPENCODE SWARM   agents={len(agents)}  messages={len(msgs)}  "
+      f"tasks={len(tasks)}  escalations={len(reqs)}")
+print("=" * 78)
+print("\\nAGENTS")
+for aid, a in sorted(agents.items()):
+    print(f"  {aid:<12} {a.get('model', '?')[:50]}  joined {a.get('joined_at', '?')[11:19]}")
+print("\\nTASKS")
+if not tasks:
+    print("  (none)")
+for tid, t in tasks.items():
+    print(f"  [{t.get('status', '?'):<9}] {tid[:8]}  {t.get('claimed_by') or t.get('assignee') or '-':<12} "
+          f"{t.get('subtask', '')[:70]}")
+print("\\nESCALATIONS (answer with: opencode-swarm say <agent> \\"reply\\")")
+if not reqs:
+    print("  (none)")
+for r in reqs[-5:]:
+    print(f"  [{r.get('id', '?')}] {r.get('agent_id', '?')}: {r.get('question', '')[:70]}")
+print("\\nRECENT BROADCASTS")
+if not msgs:
+    print("  (none)")
+for m in msgs[-15:]:
+    print(f"  {m.get('timestamp', '')[11:19]}  {m.get('from', '?'):<12} {m.get('content', '')[:90]}")
+`;
+  fs.writeFileSync(path.resolve(SWARM_DIR, 'swarm-monitor.py'), script);
+}
+
+function writePromptFiles(config, agents) {
+  fs.mkdirSync(PROMPT_DIR, { recursive: true });
+  for (const agent of agents) {
+    const goalPrefix = config.goal ? `ROUND GOAL from the operator — top priority:\n${config.goal}\n\n` : '';
+    const prompt = `${goalPrefix}${agent.system_prompt}\n\nSwarm config: ${JSON.stringify(config, null, 2)}\n\nConnect to the MCP server and start collaborating.`;
+    fs.writeFileSync(path.join(PROMPT_DIR, `${agent.id}.txt`), prompt);
+  }
 }
 
 // ============================================================
@@ -743,11 +864,33 @@ async function cmdList() {
   }
 }
 
-async function cmdStart() {
+async function cmdStart(args = []) {
+  const forceDetached = args.includes('--detached') || args.includes('-d');
+  const attach = args.includes('--attach') || args.includes('-a');
   const config = loadConfig();
   const dirs = ensureDirs();
   
-  console.log(`Starting swarm with ${config.agents.length} agents...`);
+  // tmux is the default when available — each agent gets its own visible pane.
+  const useTmux = !forceDetached && tmuxAvailable();
+  if (!useTmux && !forceDetached && !tmuxAvailable()) {
+    console.log('tmux not found — falling back to detached (log-file) mode.');
+  }
+  
+  if (useTmux && attach) {
+    // Just reattach to an existing swarm session.
+    const name = tmuxSessionName();
+    const has = spawnSync('tmux', ['has-session', '-t', name]).status === 0;
+    if (!has) { console.log(`No tmux swarm session "${name}". Run "opencode-swarm start" first.`); return; }
+    process.stdout.write('\n');
+    spawnSync('tmux', ['attach-session', '-t', name], { stdio: 'inherit' });
+    return;
+  }
+  
+  console.log(`Starting swarm with ${config.agents.length} agents${useTmux ? ' (tmux panes)' : ' (detached)'}...`);
+  
+  // Clean slate: stray agents from earlier runs would otherwise answer this round's tasks.
+  killStraySwarmProcesses();
+  await new Promise(r => setTimeout(r, 800));
   
   // Find an available port for MCP server
   const mcpPort = await findAvailablePort(8765);
@@ -758,7 +901,6 @@ async function cmdStart() {
   const yaml = require('js-yaml');
   fs.writeFileSync(CONFIG_FILE, yaml.dump(config, { lineWidth: 120, noRefs: true }));
   
-  // Start MCP server (SSE) on the chosen port.
   // NOTE: must run server.py directly — `python -m mcp.server` resolves to the
   // installed mcp SDK's stdio server, not this skill's server.
   const pythonCmd = spawnSync('which', ['python3']).status === 0 ? 'python3' : 'python';
@@ -797,7 +939,6 @@ async function cmdStart() {
   const mcpUrl = `http://127.0.0.1:${mcpPort}/mcp`;
   writeMcpConfig(process.cwd(), mcpUrl);
   try {
-    const os = require('os');
     const globalConfig = path.join(os.homedir(), '.config', 'opencode', 'opencode.json');
     if (fs.existsSync(globalConfig)) {
       const g = JSON.parse(fs.readFileSync(globalConfig, 'utf8'));
@@ -813,83 +954,158 @@ async function cmdStart() {
   const sessions = loadSessions();
   const agents = config.agents;
   
+  // Fresh session IDs per round (stable per agent, recorded for `say`).
+  const roundTs = Date.now();
   for (const agent of agents) {
-    const logFile = path.join(dirs.logDir, `${agent.id}.log`);
-    const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-    
-    // Ensure stream is ready
-    await new Promise((resolve, reject) => {
-      logStream.on('open', resolve);
-      logStream.on('error', reject);
-    });
-    
-    // Stored round goal (set via `opencode-swarm task --next "..."`) heads every prompt
-    const goalPrefix = config.goal ? `ROUND GOAL from the operator — top priority:\n${config.goal}\n\n` : '';
-    const prompt = `${goalPrefix}${agent.system_prompt}\n\nSwarm config: ${JSON.stringify(config, null, 2)}\n\nConnect to the MCP server and start collaborating.`;
-    
-    // Generate a valid session ID (must start with "ses")
-    const sessionId = `ses-swarm-${agent.id}-${Date.now()}`;
-    sessions[agent.id] = sessionId;
-    
-    const proc = spawn('opencode', [
-      'run',
-      '-m', agent.model,
-      '--session', sessionId,
-      prompt
-    ], {
-      detached: true,
-      stdio: ['ignore', logStream, logStream],
-    });
-    
-    pids[agent.id] = proc.pid;
-    proc.unref();
-    logStream.end(); // child holds its own fd now; release our handle
-    console.log(`  Started ${agent.id} (${agent.model}) -> PID ${proc.pid}, log: ${logFile}`);
+    sessions[agent.id] = `ses-swarm-${agent.id}-${roundTs}`;
+  }
+  
+  if (useTmux) {
+    startTmuxSwarm(config, agents, sessions, dirs, pythonCmd, serverPath, mcpDir, mcpPort, attach);
+  } else {
+    for (const agent of agents) {
+      const logFile = path.join(dirs.logDir, `${agent.id}.log`);
+      const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+      
+      // Ensure stream is ready
+      await new Promise((resolve, reject) => {
+        logStream.on('open', resolve);
+        logStream.on('error', reject);
+      });
+      
+      // Stored round goal (set via `opencode-swarm task --next "..."`) heads every prompt
+      const goalPrefix = config.goal ? `ROUND GOAL from the operator — top priority:\n${config.goal}\n\n` : '';
+      const prompt = `${goalPrefix}${agent.system_prompt}\n\nSwarm config: ${JSON.stringify(config, null, 2)}\n\nConnect to the MCP server and start collaborating.`;
+      
+      const proc = spawn('opencode', [
+        'run',
+        '-m', agent.model,
+        '--session', sessions[agent.id],
+        prompt
+      ], {
+        detached: true,
+        stdio: ['ignore', logStream, logStream],
+      });
+      
+      pids[agent.id] = proc.pid;
+      proc.unref();
+      logStream.end(); // child holds its own fd now; release our handle
+      console.log(`  Started ${agent.id} (${agent.model}) -> PID ${proc.pid}, log: ${logFile}`);
+    }
   }
   
   savePids(pids);
   saveSessions(sessions);
-  console.log('\nSwarm started. Use "opencode-swarm status" to check state.');
   if (config.goal) console.log(`Round goal: ${config.goal}`);
-  console.log(`Logs in ${dirs.logDir}/`);
+  if (useTmux) {
+    console.log('\nSwarm running in tmux. Each pane = one agent (Ctrl-b n / Ctrl-b p to switch).');
+    console.log('Press [Enter] in a pane to give that agent another round; Ctrl-C stops that agent.');
+  } else {
+    console.log('\nSwarm started. Use "opencode-swarm status" to check state.');
+    console.log(`Logs in ${dirs.logDir}/`);
+  }
+}
+
+// Build the tmux session: pane 0 = MCP server + live broadcast tail, one pane per agent.
+function startTmuxSwarm(config, agents, sessions, dirs, pythonCmd, serverPath, mcpDir, mcpPort, attach) {
+  const name = tmuxSessionName();
+  const stmux = (args, opts = {}) => spawnSync('tmux', args, { encoding: 'utf8', ...opts });
+  
+  // Replace any existing session of the same name.
+  if (stmux(['has-session', '-t', name]).status === 0) {
+    stmux(['kill-session', '-t', name]);
+  }
+  
+  writeRunnerScript();
+  writePromptFiles(config, agents);
+  
+  const cwd = process.cwd();
+  const monitorPath = path.resolve(SWARM_DIR, 'swarm-monitor.py');
+  writeMonitorScript(mcpPort);
+  const broadcastTail = `while true; do ${pythonCmd} ${JSON.stringify(monitorPath)}; sleep 5; done`;
+  
+  // Pane 0: MCP server (+ broadcast monitor), started detached from this shell.
+  stmux(['new-session', '-d', '-s', name, '-c', cwd,
+    `cd ${JSON.stringify(mcpDir)} && ${pythonCmd} -u server.py --port ${mcpPort}; echo '[MCP server stopped]'; exec bash`]);
+  
+  // Pane 0 becomes the broadcast monitor in a second window.
+  stmux(['new-window', '-t', name, '-n', 'broadcast', '-c', cwd, broadcastTail]);
+  
+  // Layout: grid (tiled) across the agents window.
+  for (const agent of agents) {
+    // tmux treats ":" and "." in window names as target separators — keep names plain
+    const paneName = agent.id.replace(/[^a-zA-Z0-9_-]/g, '');
+    stmux(['new-window', '-t', name, '-n', paneName, '-c', cwd,
+      `./${RUNNER_FILE} ${agent.id} ${JSON.stringify(agent.model)} ${sessions[agent.id]} ${JSON.stringify(path.resolve(PROMPT_DIR, agent.id + '.txt'))} ${JSON.stringify(path.resolve(dirs.logDir, agent.id + '.log'))}`]);
+    console.log(`  Pane window "${agent.id}" (${agent.model})`);
+  }
+  
+  // Start on the broadcast window so the operator sees the collaboration first.
+  stmux(['select-window', '-t', `${name}:broadcast`]);
+  
+  if (attach) {
+    process.stdout.write('\n');
+    spawnSync('tmux', ['attach-session', '-t', name], { stdio: 'inherit' });
+  } else {
+    console.log(`\nAttach with: tmux attach -t ${name}`);
+  }
 }
 
 async function cmdStop() {
-  const pids = loadPids();
-  if (Object.keys(pids).length === 0) {
-    console.log('No running swarm found.');
-    return;
+  const name = tmuxSessionName();
+  const hasTmux = tmuxAvailable() && spawnSync('tmux', ['has-session', '-t', name]).status === 0;
+  
+  if (hasTmux) {
+    spawnSync('tmux', ['kill-session', '-t', name]);
+    console.log(`Stopped tmux swarm session "${name}".`);
   }
   
-  console.log('Stopping swarm...');
-  for (const [name, pid] of Object.entries(pids)) {
-    try {
-      process.kill(pid, 'SIGTERM');
-      console.log(`  Stopped ${name} (PID ${pid})`);
-    } catch (e) {
-      console.log(`  Failed to stop ${name} (PID ${pid}): ${e.message}`);
-    }
-  }
+  // Also cover detached mode / stray processes.
+  killStraySwarmProcesses();
   
-  fs.unlinkSync(PID_FILE);
-  console.log('Swarm stopped.');
+  if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
+  if (!hasTmux) {
+    console.log('Swarm stopped.');
+  } else {
+    console.log('All agent and MCP processes for this project terminated.');
+  }
 }
 
 async function cmdStatus() {
   const config = loadConfig();
   const pids = loadPids();
+  const sessions = loadSessions();
+  const name = tmuxSessionName();
+  const hasTmux = tmuxAvailable() && spawnSync('tmux', ['has-session', '-t', name]).status === 0;
   
-  console.log(`Swarm: ${config.agents.length} agents configured\n`);
+  console.log(`Swarm: ${config.agents.length} agents configured`);
+  console.log(hasTmux
+    ? `Mode: tmux session "${name}" — attach: tmux attach -t ${name}`
+    : `Mode: ${liveAgents().length ? 'detached (running)' : 'not running'}`);
+  if (config.goal) console.log(`Round goal: ${config.goal}`);
+  console.log('');
   
   console.log('Agents:');
   for (const agent of config.agents) {
+    const sid = sessions[agent.id];
+    const working = agentTurnRunning(sid);
     const pid = pids[agent.id];
-    const running = pid && isProcessRunning(pid);
-    console.log(`  ${agent.id}: ${agent.model} ${running ? `🟢 PID ${pid}` : '🔴 stopped'}`);
-    console.log(`    Role: ${agent.role}`);
+    const detachedAlive = pid && isProcessRunning(pid);
+    const state = working || detachedAlive ? '🟢 working' : (sid ? '⚪ idle (session kept)' : '🔴 no session');
+    console.log(`  ${agent.id}: ${agent.model} ${state}`);
   }
   
-  console.log('\n(Use "opencode-swarm logs" to see broadcast messages)');
+  const url = loadServerUrl();
+  if (url) {
+    try {
+      const raw = await mcpCall(url, 'swarm_read_context', { agent_id: 'status' });
+      const st = JSON.parse(raw);
+      console.log(`\nShared state: ${(st.messages || []).length} messages, ${Object.keys(st.tasks || {}).length} tasks, ${(st.human_requests || []).length} escalations`);
+    } catch (e) {
+      console.log('\n(MCP server unreachable — swarm may be shutting down)');
+    }
+  }
+  console.log('\n"opencode-swarm inbox" for escalations · "opencode-swarm logs -f" for the feed');
 }
 
 function isProcessRunning(pid) {
@@ -946,7 +1162,7 @@ switch (command) {
     cmdList().catch(e => { console.error(e); process.exit(1); });
     break;
   case 'start':
-    cmdStart().catch(e => { console.error(e); process.exit(1); });
+    cmdStart(args.slice(1)).catch(e => { console.error(e); process.exit(1); });
     break;
   case 'stop':
     cmdStop().catch(e => { console.error(e); process.exit(1); });

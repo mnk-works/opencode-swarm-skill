@@ -115,7 +115,9 @@ Verify: `opencode-swarm` (prints usage) and `opencode-swarm models`.
 | `opencode-swarm list` | Show current swarm roster |
 | `opencode-swarm add --id agent-4 --model X [--role R]` | Add an agent to the roster |
 | `opencode-swarm remove agent-2` | Remove an agent (peer prompts regenerate) |
-| `opencode-swarm start` | Launch MCP server + all agents |
+| `opencode-swarm start` | Launch MCP server + all agents in tmux panes |
+| `opencode-swarm start -a` | Launch and attach to the tmux session |
+| `opencode-swarm start -d` | Launch detached (log files only) |
 | `opencode-swarm stop` | Stop all swarm agents |
 | `opencode-swarm status` | Show agent status |
 | `opencode-swarm logs [--follow]` | View recent broadcasts |
@@ -217,6 +219,41 @@ opencode-swarm inbox
 opencode-swarm status      # who's alive
 opencode-swarm logs -f     # live broadcast feed
 ```
+
+## tmux mode: one pane per agent
+
+`start` launches the swarm inside a tmux session so you can **watch every agent think, side by side**:
+
+```bash
+opencode-swarm start              # build the tmux session (default when tmux is installed)
+opencode-swarm start -a           # build it and attach immediately
+opencode-swarm start -d           # opt out: detached, log files only
+```
+
+What you get — one tmux window per agent plus a live dashboard:
+
+| Window | Contents |
+|--------|----------|
+| `broadcast` | live dashboard: agents, tasks + status, escalations, recent broadcasts (refreshes every 5s) |
+| `agent-1` … `agent-N` | that agent's OpenCode turn, streaming in real time |
+
+```bash
+tmux attach -t swarm-<project>        # (re)attach to a running swarm
+opencode-swarm start -a               # or reattach via the CLI
+```
+
+### Why this changes the architecture
+
+In detached mode each agent is a one-shot process: it runs a turn, exits, and its context is gone. Under tmux the **pane keeps the agent's session alive**, so:
+
+- **`[Enter]` in a pane = another round for that agent**, with its full conversation history intact — iterate with a single agent without re-prompting from scratch.
+- **`Ctrl-C` in a pane stops just that agent**, leaving the rest of the swarm running.
+- **`opencode-swarm say agent-3 "…"`** injects a message into the live pane's session.
+- The MCP server lives in the tmux session too, so it dies cleanly with `opencode-swarm stop` instead of lingering on a port.
+
+Navigation: `Ctrl-b n` / `Ctrl-b p` next/previous window, `Ctrl-b l` last window, `Ctrl-b w` window list, `Ctrl-b d` detach (swarm keeps running).
+
+> Use `--detached` for CI, scripts, or headless boxes where you don't want a tmux session.
 
 ### Round lifecycle
 
