@@ -30,19 +30,26 @@ USAGE
   opencode-swarm <command> [options]
 
 COMMANDS
-  init [--interactive|-i] [--non-interactive|-n]  Create .opencode/swarm.yaml (interactive by default)
-  models [--provider X]    List available models grouped by provider
-  start                    Launch all agents (background processes with logs)
-  stop                     Stop all running swarm agents
-  status                   Show registered agents and recent activity
-  logs [--follow]          Show recent broadcast messages
+  init [--interactive|-i] [--non-interactive|-n]  Create .opencode/swarm.yaml
+  models [--provider X] [--free]                  List models grouped by provider
+  add [--id ID] [--model MODEL] [--role ROLE]     Add agent to swarm
+  remove [ID]                                     Remove agent from swarm
+  list                                            List current swarm agents
+  start                                           Launch all agents
+  stop                                            Stop all swarm agents
+  status                                          Show agent status and activity
+  logs [--follow]                                 Show recent broadcasts
 
 EXAMPLES
   opencode-swarm init                    # Interactive setup (default)
   opencode-swarm init -i                 # Interactive setup (explicit)
-  opencode-swarm init -n                 # Auto-detect with confirmation
-  opencode-swarm models                  # See all available models
+  opencode-swarm init -n                 # Simplified setup
+  opencode-swarm models                  # See all models
   opencode-swarm models -p openrouter    # Filter by provider
+  opencode-swarm models --free           # Only free models
+  opencode-swarm add --id agent-4 --model openrouter/nemotron-3-ultra:free
+  opencode-swarm remove agent-2
+  opencode-swarm list
   opencode-swarm start
   opencode-swarm status
   opencode-swarm logs -f
@@ -227,63 +234,72 @@ async function cmdInit(args) {
     // Default to interactive - require explicit configuration
     console.log('=== Swarm Configuration Required ===');
     console.log('A swarm needs at least 2 agents with different models/providers.');
-    console.log('Run with --non-interactive to accept auto-detected defaults.\n');
+    console.log('Run with --non-interactive for simplified setup.\n');
     agents = await selectModelsInteractive();
     if (!agents) return;
   } else {
-    // Non-interactive: auto-detect and confirm
+    // Non-interactive: show providers and require manual selection (simplified)
     const modelsByProvider = getAvailableModels();
-    const nemotronModels = {};
+    const providers = Object.keys(modelsByProvider).sort();
     
-    for (const [provider, models] of Object.entries(modelsByProvider)) {
-      for (const model of models) {
-        if (model.toLowerCase().includes('nemotron')) {
-          nemotronModels[provider] = model;
-          break;
-        }
-      }
+    if (providers.length === 0) {
+      console.log('No models found. Configure providers in OpenCode first.');
+      return;
     }
     
-    const providers = Object.keys(nemotronModels);
-    if (providers.length >= 3) {
-      agents = [
-        { id: 'agent-1', model: nemotronModels[providers[0]], role: 'Swarm agent' },
-        { id: 'agent-2', model: nemotronModels[providers[1]], role: 'Swarm agent' },
-        { id: 'agent-3', model: nemotronModels[providers[2]], role: 'Swarm agent' },
-      ];
-    } else {
-      const allModels = [];
-      for (const [provider, models] of Object.entries(modelsByProvider)) {
-        if (models.length > 0) allModels.push({ provider, model: models[0] });
-      }
-      agents = allModels.slice(0, 3).map((m, i) => ({
-        id: `agent-${i + 1}`,
-        model: m.model,
-        role: 'Swarm agent'
-      }));
-    }
-    
-    // Show what we're about to create and require confirmation
-    console.log('Auto-detected swarm configuration:');
-    for (const a of agents) {
-      console.log(`  ${a.id}: ${a.model}`);
-    }
+    console.log('=== Simplified Swarm Setup ===');
+    console.log('Available providers:');
+    providers.forEach((p, i) => console.log(`  ${i + 1}. ${p} (${modelsByProvider[p].length} models)`));
     
     const readline = require('readline').createInterface({
       input: process.stdin,
       output: process.stdout,
     });
-    const answer = await new Promise(r => readline.question('\nAccept this configuration? (y/N): ', r));
-    readline.close();
-    if (answer.toLowerCase() !== 'y') {
-      console.log('Aborted. Run with --interactive to choose manually.');
-      return;
+    const question = (q) => new Promise(r => readline.question(q, r));
+    
+    let numAgents = 3;
+    const numAns = await question('\nNumber of agents [3]: ');
+    if (numAns.trim()) numAgents = parseInt(numAns) || 3;
+    
+    agents = [];
+    const usedModels = new Set();
+    
+    for (let i = 0; i < numAgents; i++) {
+      console.log(`\n--- Agent ${i + 1} of ${numAgents} ---`);
+      
+      const provAns = await question(`Provider (${providers.join(', ')}) [${providers[0]}]: `);
+      const provider = provAns.trim() || providers[0];
+      if (!modelsByProvider[provider]) {
+        console.log(`Unknown provider: ${provider}`);
+        i--;
+        continue;
+      }
+      
+      const models = modelsByProvider[provider].filter(m => !usedModels.has(m));
+      console.log(`Models from ${provider}:`);
+      models.slice(0, 10).forEach((m, idx) => console.log(`  ${idx + 1}. ${m}`));
+      if (models.length > 10) console.log(`  ... and ${models.length - 10} more`);
+      
+      const modelAns = await question(`Select model [1]: `);
+      const modelIdx = modelAns.trim() ? parseInt(modelAns) - 1 : 0;
+      const model = models[modelIdx] || models[0];
+      
+      if (!model) {
+        console.log('No models available for this provider');
+        i--;
+        continue;
+      }
+      
+      usedModels.add(model);
+      const defaultId = `agent-${i + 1}`;
+      const idAns = await question(`Agent ID [${defaultId}]: `);
+      const id = idAns.trim() || defaultId;
+      const role = 'Swarm agent';
+      
+      agents.push({ id, model, role });
     }
-  }
-  
-  // Generate system prompts
-  for (const agent of agents) {
-    agent.system_prompt = generateSystemPrompt(agent, agents);
+    
+    readline.close();
   }
   
   const config = {
@@ -324,8 +340,10 @@ async function cmdInit(args) {
 }
 
 async function cmdModels(args) {
+  const providerIdx = args.indexOf('--provider');
   const providerFilter = args.find(a => a.startsWith('--provider='))?.split('=')[1] 
-    || args[args.indexOf('--provider') + 1];
+    || (providerIdx >= 0 ? args[providerIdx + 1] : undefined);
+  const freeOnly = args.includes('--free') || args.includes('-f');
   
   const modelsByProvider = getAvailableModels(providerFilter);
   
@@ -336,11 +354,151 @@ async function cmdModels(args) {
     return;
   }
   
+  if (freeOnly) {
+    for (const [provider, models] of Object.entries(modelsByProvider)) {
+      modelsByProvider[provider] = models.filter(m => m.includes(':free'));
+    }
+    // Remove empty providers
+    for (const provider of Object.keys(modelsByProvider)) {
+      if (modelsByProvider[provider].length === 0) {
+        delete modelsByProvider[provider];
+      }
+    }
+  }
+  
   printModels(modelsByProvider);
   
   // Summary
   const total = Object.values(modelsByProvider).reduce((sum, m) => sum + m.length, 0);
-  console.log(`Total: ${total} models across ${Object.keys(modelsByProvider).length} provider(s)`);
+  console.log(`Total: ${total} models across ${Object.keys(modelsByProvider).length} provider(s)${freeOnly ? ' (free only)' : ''}`);
+}
+
+async function cmdAdd(args) {
+  const config = loadConfig();
+  const modelsByProvider = getAvailableModels();
+  const providers = Object.keys(modelsByProvider).sort();
+  
+  if (providers.length === 0) {
+    console.log('No models found. Configure providers in OpenCode first.');
+    return;
+  }
+  
+  // Parse args: opencode-swarm add --id agent-4 --model openrouter/nemotron-3-ultra:free
+  const idIdx = args.indexOf('--id');
+  const modelIdx = args.indexOf('--model');
+  const roleIdx = args.indexOf('--role');
+  
+  const idArg = args.find(a => a.startsWith('--id='))?.split('=')[1] || (idIdx >= 0 ? args[idIdx + 1] : undefined);
+  const modelArg = args.find(a => a.startsWith('--model='))?.split('=')[1] || (modelIdx >= 0 ? args[modelIdx + 1] : undefined);
+  const roleArg = args.find(a => a.startsWith('--role='))?.split('=')[1] || (roleIdx >= 0 ? args[roleIdx + 1] : undefined);
+  
+  const readline = require('readline').createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const question = (q) => new Promise(r => readline.question(q, r));
+  
+  let agentId = idArg;
+  if (!idArg) {
+    const defaultId = `agent-${config.agents.length + 1}`;
+    const ans = await question(`Agent ID [${defaultId}]: `);
+    agentId = ans.trim() || defaultId;
+  }
+  
+  // Check if ID already exists
+  if (config.agents.some(a => a.id === agentId)) {
+    console.log(`Agent ${agentId} already exists.`);
+    readline.close();
+    return;
+  }
+  
+  let model = modelArg;
+  if (!model) {
+    console.log('\nAvailable providers:');
+    providers.forEach((p, i) => console.log(`  ${i + 1}. ${p} (${modelsByProvider[p].length} models)`));
+    const provAns = await question('\nProvider: ');
+    const provider = provAns.trim();
+    if (!modelsByProvider[provider]) {
+      console.log(`Unknown provider: ${provider}`);
+      readline.close();
+      return;
+    }
+    
+    const models = modelsByProvider[provider];
+    console.log(`Models from ${provider}:`);
+    models.forEach((m, idx) => console.log(`  ${idx + 1}. ${m}`));
+    
+    const modelAns = await question('Select model [1]: ');
+    const modelIdx = modelAns.trim() ? parseInt(modelAns) - 1 : 0;
+    model = models[modelIdx] || models[0];
+  }
+  
+  let role = roleArg || 'Swarm agent';
+  
+  // Generate system prompt
+  const newAgent = { id: agentId, model, role };
+  const allAgents = [...config.agents, newAgent];
+  newAgent.system_prompt = generateSystemPrompt(newAgent, allAgents);
+  
+  config.agents.push(newAgent);
+  
+  const yaml = require('js-yaml');
+  fs.writeFileSync(CONFIG_FILE, yaml.dump(config, { lineWidth: 120, noRefs: true }));
+  
+  console.log(`\nAdded ${agentId}: ${model} — ${role}`);
+  readline.close();
+}
+
+async function cmdRemove(args) {
+  const config = loadConfig();
+  
+  if (config.agents.length <= 1) {
+    console.log('Cannot remove: swarm needs at least 1 agent.');
+    return;
+  }
+  
+  // Parse args: opencode-swarm remove agent-2
+  const targetId = args.find(a => !a.startsWith('-'));
+  
+  let agentId = targetId;
+  if (!agentId) {
+    console.log('\nCurrent agents:');
+    config.agents.forEach((a, i) => console.log(`  ${i + 1}. ${a.id}: ${a.model}`));
+    
+    const readline = require('readline').createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    const ans = await new Promise(r => readline.question('\nAgent ID to remove: ', r));
+    readline.close();
+    agentId = ans.trim();
+  }
+  
+  const idx = config.agents.findIndex(a => a.id === agentId);
+  if (idx === -1) {
+    console.log(`Agent ${agentId} not found.`);
+    return;
+  }
+  
+  const removed = config.agents.splice(idx, 1)[0];
+  
+  // Regenerate system prompts for remaining agents (peer list changed)
+  for (const agent of config.agents) {
+    agent.system_prompt = generateSystemPrompt(agent, config.agents);
+  }
+  
+  const yaml = require('js-yaml');
+  fs.writeFileSync(CONFIG_FILE, yaml.dump(config, { lineWidth: 120, noRefs: true }));
+  
+  console.log(`\nRemoved ${removed.id}: ${removed.model}`);
+}
+
+async function cmdList() {
+  const config = loadConfig();
+  console.log('\nCurrent swarm agents:');
+  for (const a of config.agents) {
+    console.log(`  ${a.id}: ${a.model} — ${a.role}`);
+  }
 }
 
 async function cmdStart() {
@@ -479,6 +637,15 @@ switch (command) {
     break;
   case 'models':
     cmdModels(args.slice(1)).catch(e => { console.error(e); process.exit(1); });
+    break;
+  case 'add':
+    cmdAdd(args.slice(1)).catch(e => { console.error(e); process.exit(1); });
+    break;
+  case 'remove':
+    cmdRemove(args.slice(1)).catch(e => { console.error(e); process.exit(1); });
+    break;
+  case 'list':
+    cmdList().catch(e => { console.error(e); process.exit(1); });
     break;
   case 'start':
     cmdStart().catch(e => { console.error(e); process.exit(1); });
