@@ -30,7 +30,7 @@ USAGE
   opencode-swarm <command> [options]
 
 COMMANDS
-  init [--interactive]     Create .opencode/swarm.yaml (interactive model selection)
+  init [--interactive|-i] [--non-interactive|-n]  Create .opencode/swarm.yaml (interactive by default)
   models [--provider X]    List available models grouped by provider
   start                    Launch all agents (background processes with logs)
   stop                     Stop all running swarm agents
@@ -38,13 +38,14 @@ COMMANDS
   logs [--follow]          Show recent broadcast messages
 
 EXAMPLES
-  opencode-swarm init                    # Quick start with defaults
-  opencode-swarm init --interactive      # Pick models interactively
+  opencode-swarm init                    # Interactive setup (default)
+  opencode-swarm init -i                 # Interactive setup (explicit)
+  opencode-swarm init -n                 # Auto-detect with confirmation
   opencode-swarm models                  # See all available models
-  opencode-swarm models --provider openrouter
+  opencode-swarm models -p openrouter    # Filter by provider
   opencode-swarm start
   opencode-swarm status
-  opencode-swarm logs --follow
+  opencode-swarm logs -f
 `);
 }
 
@@ -218,15 +219,19 @@ Collaborate via swarm.* MCP tools:
 async function cmdInit(args) {
   ensureDirs();
   const interactive = args.includes('--interactive') || args.includes('-i');
+  const nonInteractive = args.includes('--non-interactive') || args.includes('-n');
   
   let agents;
   
-  if (interactive) {
-    console.log('=== Interactive Swarm Setup ===');
+  if (interactive || !nonInteractive) {
+    // Default to interactive - require explicit configuration
+    console.log('=== Swarm Configuration Required ===');
+    console.log('A swarm needs at least 2 agents with different models/providers.');
+    console.log('Run with --non-interactive to accept auto-detected defaults.\n');
     agents = await selectModelsInteractive();
     if (!agents) return;
   } else {
-    // Default: try to use 3 different providers for Nemotron if available
+    // Non-interactive: auto-detect and confirm
     const modelsByProvider = getAvailableModels();
     const nemotronModels = {};
     
@@ -247,7 +252,6 @@ async function cmdInit(args) {
         { id: 'agent-3', model: nemotronModels[providers[2]], role: 'Swarm agent' },
       ];
     } else {
-      // Fallback to first 3 available models from different providers
       const allModels = [];
       for (const [provider, models] of Object.entries(modelsByProvider)) {
         if (models.length > 0) allModels.push({ provider, model: models[0] });
@@ -257,6 +261,23 @@ async function cmdInit(args) {
         model: m.model,
         role: 'Swarm agent'
       }));
+    }
+    
+    // Show what we're about to create and require confirmation
+    console.log('Auto-detected swarm configuration:');
+    for (const a of agents) {
+      console.log(`  ${a.id}: ${a.model}`);
+    }
+    
+    const readline = require('readline').createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    const answer = await new Promise(r => readline.question('\nAccept this configuration? (y/N): ', r));
+    readline.close();
+    if (answer.toLowerCase() !== 'y') {
+      console.log('Aborted. Run with --interactive to choose manually.');
+      return;
     }
   }
   
